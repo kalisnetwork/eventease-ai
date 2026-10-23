@@ -1,6 +1,7 @@
 import { GoogleGenAI } from '@google/genai'
 import { createClient } from '@/lib/supabase/server'
 import { jsonError, jsonOk } from '@/lib/utils/api'
+import { parseAmount, formatAmount, formatAmountPlain } from '@/lib/utils/amounts'
 import { summarizeBudget, summarizeGuests, summarizeTasks } from '@/lib/calculations/summary'
 
 type Body = { eventId?: string; message?: string }
@@ -48,6 +49,45 @@ export async function POST(request: Request) {
     )
   }
 
+  // Budget update detection: "update budget to 50", "set budget to 50k", "make budget 1 lakh"
+  const budgetRegex = /(?:update|set|change|make)\s+(?:the\s+)?(?:total\s+)?budget\s+(?:to|as|at|of)\s+(.+)/i
+  const budgetMatch = message.match(budgetRegex)
+
+  let budgetUpdated = false
+  let updatedBudgetAmount: number | null = null
+  let budgetUpdatedMessage = ''
+
+  if (budgetMatch) {
+    const raw = budgetMatch[1]
+      .replace(/[₹$€£]/g, '')
+      .replace(/,/g, '')
+      .replace(/\s+(rupees?|dollars?|INR|USD|EUR|GBP)$/i, '')
+      .trim()
+
+    const parsed = parseAmount(raw)
+
+    if (parsed) {
+      const { data: eventForCurrency } = await supabase
+        .from('events')
+        .select('id, title, currency')
+        .eq('id', eventId)
+        .maybeSingle()
+
+      const currency = eventForCurrency?.currency ?? 'INR'
+      const { error: updateErr } = await supabase
+        .from('events')
+        .update({ total_budget: parsed.value })
+        .eq('id', eventId)
+
+      if (!updateErr) {
+        budgetUpdated = true
+        updatedBudgetAmount = parsed.value
+        const display = formatAmountPlain(parsed.value, currency)
+        budgetUpdatedMessage = `Your budget has been updated to ${parsed.assumed ? `${formatAmountPlain(parsed.value * 1000, currency)} (you said "${raw}" — I treated this as ${parsed.value})` : display} ${currency}.`
+      }
+    }
+  }
+
   const { data: event } = await supabase
     .from('events')
     .select(
@@ -85,6 +125,8 @@ export async function POST(request: Request) {
   const tasks = summarizeTasks(event.tasks ?? [])
   const guests = summarizeGuests(event.guests ?? [])
 
+  const currency = event.currency ?? 'INR'
+
   const context = {
     event: {
       title: event.title,
@@ -104,6 +146,9 @@ export async function POST(request: Request) {
       remaining: budget.remaining,
       overrun: budget.overrun,
       currency: event.currency,
+      display: formatAmount(budget.budget, currency),
+      remainingDisplay: formatAmount(budget.remaining, currency),
+      actualDisplay: formatAmount(budget.actual, currency),
     },
     tasks: {
       total: tasks.total,
@@ -120,16 +165,39 @@ export async function POST(request: Request) {
       declined: guests.declined,
     },
     vendors: (event.vendors ?? []).slice(0, 25),
+    justUpdatedBudget: budgetUpdated,
+    updatedBudgetAmount,
   }
 
+  const budgetUpdateNote = budgetUpdated
+    ? `
+BUDGET UPDATE CONFIRMED: You just changed the total budget to ${formatAmount(updatedBudgetAmount ?? budget.budget, currency)}. Confirm this clearly at the start of your reply.`
+    : ''
+
   const systemInstruction = `You are the EventEase AI event-planning assistant.
-Use only the supplied event data for facts. Never invent budget figures, vendors, guests, or dates.
-If information is missing, say what is missing and give a concrete next step.
-Be concise, practical, and specific. Prioritise risks such as budget overruns, overdue tasks, and unanswered RSVPs.
-Format with short paragraphs and hyphen bullet points. Do not use tables or HTML.
-The current date and time is ${new Date().toISOString()}.
+
+CORE RULES:
+- Use ONLY the supplied event data for facts. Never invent budget figures, vendors, guests, or dates.
+- If information is missing, say what is missing and give a concrete next step.
+- Be concise, practical, and specific. Prioritise risks such as budget overruns, overdue tasks, and unanswered RSVPs.
+- Format with short paragraphs and hyphen bullet points. Do NOT use tables, HTML, or markdown code blocks.
+- Keep replies plain text. Do not use bold, italics, or markdown formatting.
+
+NUMBER & CURRENCY RULES (CRITICAL):
+- Currency is ${currency}. Format all amounts using Indian comma separators when currency is INR (e.g. 50,000; 1,00,000; 1,00,00,000).
+- When the user says "50" for a budget in an Indian context without units, interpret it as 50,000. "50k" means 50,000. "1 lakh" means 1,00,000. "1 crore" means 1,00,00,000.
+- Never say "50 INR" when they mean fifty thousand.
+- If budget was just updated (justUpdatedBudget=true), explicitly confirm the new amount in correct format at the start.
+
+BEHAVIOR:
+- The current date and time is ${new Date().toISOString()}.
+- If the user asks to change budget/guests/location/dates/status and it's feasible, confirm the update clearly.
+- Keep responses actionable.
+
 EVENT DATA:
-${JSON.stringify(context)}`
+${JSON.stringify(context)}
+
+${budgetUpdateNote}`
 
   const contents = [...(history ?? [])]
     .reverse()
@@ -146,8 +214,8 @@ ${JSON.stringify(context)}`
       contents,
       config: {
         systemInstruction,
-        temperature: 0.4,
-        maxOutputTokens: 1200,
+        temperature: 0.3,
+        maxOutputTokens: 1000,
       },
     })
 
@@ -156,12 +224,19 @@ ${JSON.stringify(context)}`
       return jsonError('The assistant returned an empty response', 502, 'EMPTY_REPLY')
     }
 
+    // Strip any markdown formatting just in case the model slipped
+    const cleanReply = reply
+      .replace(/\*\*/g, '')
+      .replace(/__/g, '')
+      .replace(/`{3}[\s\S]*?`{3}/g, '')
+      .replace(/`([^`]+)`/g, '$1')
+
     await supabase.from('ai_messages').insert([
       { user_id: user.id, event_id: eventId, role: 'user', content: message },
-      { user_id: user.id, event_id: eventId, role: 'assistant', content: reply.slice(0, 8000) },
+      { user_id: user.id, event_id: eventId, role: 'assistant', content: cleanReply.slice(0, 8000) },
     ])
 
-    return jsonOk({ reply })
+    return jsonOk({ reply: cleanReply })
   } catch (error) {
     console.error('assistant_error', error)
     return jsonError(
