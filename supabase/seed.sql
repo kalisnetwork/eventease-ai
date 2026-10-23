@@ -1,0 +1,4 @@
+-- Intentionally empty.
+-- This project does not seed fake events, expenses, guests, vendors, or activity.
+-- Demo data, if ever needed for evaluators, must be created explicitly and
+-- clearly labelled as demo content in the README.
