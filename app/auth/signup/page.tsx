@@ -32,7 +32,13 @@ export default function SignUp() {
     })
     
     if (error) {
-      setError(error.message)
+      if (error.message.includes('rate limit')) {
+        setError('Too many signup attempts. Please wait a moment and try again.')
+      } else if (error.message.includes('already registered')) {
+        setError('This email is already registered. Please sign in instead.')
+      } else {
+        setError(error.message)
+      }
       setLoading(false)
     } else {
       setSuccess(true)
