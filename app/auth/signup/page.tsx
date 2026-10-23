@@ -20,14 +20,13 @@ export default function SignUp() {
     setError(null)
     
     const supabase = createClient()
-    const { error } = await supabase.auth.signUp({
+    const { data, error } = await supabase.auth.signUp({
       email,
       password,
       options: {
         data: {
           full_name: fullName,
         },
-        emailRedirectTo: `${window.location.origin}/auth/callback`,
       },
     })
     
@@ -40,6 +39,9 @@ export default function SignUp() {
         setError(error.message)
       }
       setLoading(false)
+    } else if (data?.session) {
+      router.push('/dashboard')
+      router.refresh()
     } else {
       setSuccess(true)
       setLoading(false)
